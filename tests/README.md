@@ -5,8 +5,9 @@
 ## 宿主集成自检（v1.1.0 · 不需要 Blender 的那一条可单独跑）
 
 ```bash
-node tests/client_bundle_selftest.mjs   # 客户端半边：假 window.__ModuleLoader__ 下装载 lib/client.js
-node tests/host_routes_selftest.mjs     # /host/* 路由（需要后端 127.0.0.1:9877；Blender 不在则 SKIP 且 exit 0）
+node tests/client_bundle_selftest.mjs      # 客户端半边：假 window.__ModuleLoader__ 下装载 lib/client.js
+node tests/host_routes_selftest.mjs        # /host/* 路由（需要后端 127.0.0.1:9877；Blender 不在则 SKIP 且 exit 0）
+node tests/handshake_recovery_selftest.mjs # 握手自愈：handshake-stale / addon-unreachable 两种死锁（已并入 npm test）
 ```
 
 - **`client_bundle_selftest.mjs`**：这是"**用户重启 DSH 后插件会不会崩**"的安全网。断言注册 `id` ===
@@ -19,7 +20,11 @@ node tests/host_routes_selftest.mjs     # /host/* 路由（需要后端 127.0.0.
   Blender 不在、后端不可达、或后端未装载 `/host` → **SKIP 且 exit 0**（不算失败）。
   判据 7 需临时改场景名构造错配：默认开、`finally` 还原并核验 stdout、`DSH_HOST_TEST_NO_MUTATE=1` 可关、
   写租约被别的会话持有时**不夺租约**而是跳过（共享同一 Blender 时的有意取舍）。
-- 两条都不进 `npm test` 主链（`host_routes` 依赖真后端），需要时手动跑。
+- **`handshake_recovery_selftest.mjs`**：用 mock addon 精确复现「探测漏了一次、命令还能用」的现场，要求 `/host/ready`
+  在探测恢复后**无需人工干预**自愈；另覆盖「addon 先完全不在、之后启动」的重连路径。判据 11 用 `/who` 的
+  `metrics.calls` 增量 0 + 中位延迟 < 50 ms 钉住"响应路径不碰 Blender"。**已并入 `npm test` 链尾**（约 2 s 常态，
+  60 s 看门狗；`--runtime <dir>` 可对未修复版本跑阴性对照，应为 1）。
+- 前两条**不进** `npm test` 主链（`host_routes` 依赖真后端），需要时手动跑。
 
 ## 上游整合 A1–A5 自检（v0.9.6）
 

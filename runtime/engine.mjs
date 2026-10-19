@@ -641,6 +641,7 @@ export class AddonClient {
     this.proto = null;          // 首次使用时解析（显式配置 → 直取；auto → 探测一次并缓存）
     this.protocolInfo = null;
     this._seq = 0;
+    this._connecting = null;    // 单飞：并发 ensure() 共用同一条 TCP（评审要求）
   }
   async protocol() {
     if (!this.proto) {
@@ -652,11 +653,34 @@ export class AddonClient {
   connect(timeoutMs = 4000) {
     return new Promise((resolve, reject) => {
       const s = net.connect({ host: this.addr.host, port: this.addr.port });
-      const t = setTimeout(() => { s.destroy(); reject(new Error('connect timeout')); }, timeoutMs);
-      s.once('connect', () => { clearTimeout(t); this.sock = s; resolve(true); });
-      s.once('error', (e) => { clearTimeout(t); this.sock = null; reject(e); });
-      s.on('data', (d) => this._onData(d));
-      s.on('close', () => { this.sock = null; if (this.pending) { this.pending.reject(new Error('socket closed')); this.pending = null; } });
+      let settled = false;
+      const fail = (e) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(t);
+        reject(e);
+      };
+      const t = setTimeout(() => { try { s.destroy(); } catch (e) {} fail(new Error('connect timeout')); }, timeoutMs);
+      s.once('connect', () => {
+        if (settled) { try { s.destroy(); } catch (e) {} return; }   // 超时后才连上：丢弃，别抢走 this.sock
+        settled = true;
+        clearTimeout(t);
+        this.sock = s;
+        resolve(true);
+      });
+      s.once('error', (e) => {
+        // 只清自己：迟到/旧的 socket 出错不能把新 socket 置空（会制造假 addon-unreachable）
+        if (this.sock === s) this.sock = null;
+        fail(e);
+      });
+      s.on('data', (d) => { if (this.sock === s) this._onData(d); });
+      s.on('close', () => {
+        // 同理：只处理"当前"socket 的关闭；旧 socket 的 close 不得拒掉在飞请求
+        if (this.sock === s) {
+          this.sock = null;
+          if (this.pending) { this.pending.reject(new Error('socket closed')); this.pending = null; }
+        }
+      });
     });
   }
   _onData(d) {
@@ -672,7 +696,15 @@ export class AddonClient {
     try { p.resolve(p.post ? p.post(r.data) : r.data); }
     catch (err) { p.reject(err); }
   }
-  async ensure() { if (!this.sock) await this.connect(); }
+  ensure() {
+    if (this.sock) return Promise.resolve();
+    // 单飞：自愈恢复是唯一绕过 send 串行队列的 ensure() 调用方，并发两次会开两条 TCP；
+    // 随后关掉"非当前"那条会把 this.sock 置空 → 假 addon-unreachable，还可能拒掉在飞请求。
+    if (!this._connecting) {
+      this._connecting = this.connect().finally(() => { this._connecting = null; });
+    }
+    return this._connecting;
+  }
   send(type, params = {}, timeoutMs = 120000) {
     const run = async () => {
       const info = await this.protocol();
@@ -806,9 +838,9 @@ export function createEngine(opts = {}) {
       }
     } catch (e) { /* 记证据失败绝不影响命令本身 */ }
   }
-  /** 自愈节流状态（见 scheduleHandshakeRecovery） */
+  /** 自愈节流状态（见 scheduleHandshakeRecovery；attempts / lastOkAt / lastError 由 /who 暴露） */
   const HANDSHAKE_RECOVERY_COOLDOWN_MS = 5000;
-  const handshakeRecovery = { lastAt: 0, inFlight: false, attempts: 0, lastOkAt: null };
+  const handshakeRecoveryState = { lastAt: 0, inFlight: false, attempts: 0, lastOkAt: null, lastError: null };
 
   /**
    * 后台重连 + 重探握手 —— 修"一次探测失败被永久缓存"的死局（现场 bug，用户实机复现）。
@@ -830,28 +862,32 @@ export function createEngine(opts = {}) {
    */
   function scheduleHandshakeRecovery() {
     const now = Date.now();
-    if (handshakeRecovery.inFlight) return;
-    if (now - handshakeRecovery.lastAt < HANDSHAKE_RECOVERY_COOLDOWN_MS) return;
-    handshakeRecovery.lastAt = now;
-    handshakeRecovery.inFlight = true;
-    handshakeRecovery.attempts++;
+    if (handshakeRecoveryState.inFlight) return;
+    if (now - handshakeRecoveryState.lastAt < HANDSHAKE_RECOVERY_COOLDOWN_MS) return;
+    handshakeRecoveryState.lastAt = now;
+    handshakeRecoveryState.inFlight = true;
+    handshakeRecoveryState.attempts++;
     Promise.resolve()
       .then(() => addon.ensure().catch(() => {}))
       .then(() => {
+        // 连不上就别再空探测：Blender 长期关闭时省掉每 5s 两次探测 socket（评审建议）
+        if (!addon.sock) return null;
         resetProtocolCache();                 // 关键：不清缓存只会命中上次那份 fallback
         addon.proto = null;
         addon.protocolInfo = null;
         return addon.protocol();
       })
       .then((pi) => {
-        if (pi && typeof pi === 'object') {
-          readiness.handshakeFrom = pi.from || null;
-          readiness.handshakeId = (pi.proto && pi.proto.id) || null;
-          if (pi.from && pi.from !== 'fallback') handshakeRecovery.lastOkAt = Date.now();
+        if (!pi || typeof pi !== 'object') return;
+        readiness.handshakeFrom = pi.from || null;
+        readiness.handshakeId = (pi.proto && pi.proto.id) || null;
+        if (pi.from && pi.from !== 'fallback') {
+          handshakeRecoveryState.lastOkAt = Date.now();
+          handshakeRecoveryState.lastError = null;
         }
       })
-      .catch(() => { /* 仍不可达：保持原 reason，冷却后下一轮再试 */ })
-      .finally(() => { handshakeRecovery.inFlight = false; });
+      .catch((e) => { handshakeRecoveryState.lastError = String((e && e.message) || e).slice(0, 200); })
+      .finally(() => { handshakeRecoveryState.inFlight = false; });
   }
 
   /**
@@ -2194,7 +2230,7 @@ export function createEngine(opts = {}) {
   // S13（§7.1）：`hostReady` 必须便宜 —— 它每 2 s 被面板轮询一次做门控。
   // 轨迹台账是 `fs.appendFileSync` 到 workDir（本机是 drvfs 挂载），实测一次 ~35 ms：
   // 不加进来会让 /host/ready 从 ~1.5 ms 变成 ~37 ms（比 /health 慢 14 倍），直接违背 §7.1。
-  const TRAJ_SKIP = new Set(['metrics', 'status', 'protocol', 'sceneEpoch', 'hostReady']);
+  const TRAJ_SKIP = new Set(['metrics', 'status', 'protocol', 'sceneEpoch', 'hostReady', 'handshakeRecovery']);
   function trajShortHash(s) {
     let h = 0;
     for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
@@ -2277,6 +2313,13 @@ export function createEngine(opts = {}) {
     /** 通道指标快照（inflight / last_cmd / 超时计数） */
     metrics() {
       return { ...metrics, lastCmdAgeMs: metrics.lastCmdAt ? Date.now() - metrics.lastCmdAt : null };
+    },
+    /**
+     * 握手自愈诊断快照（/who 用）—— 现场售后排查"面板为什么还没回来"：
+     * attempts 一直涨但 lastOkAt 不涨 ⇒ 还在重连/探测失败，直接看 lastError。
+     */
+    handshakeRecovery() {
+      return { ...handshakeRecoveryState, cooldownMs: HANDSHAKE_RECOVERY_COOLDOWN_MS };
     },
     /** 通道实际用的 addon 协议（显式配置 or auto 探测结果） */
     async protocol() { return await protocolInfo(); },

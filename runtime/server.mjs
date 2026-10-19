@@ -698,7 +698,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && p === '/who') {
-      json(res, 200, { ok: true, lease: leaseView(), metrics: engine.metrics(), stats: stats, config: describeConfig({ httpPort: PORT }), requests: Object.fromEntries(reqCounts) });
+      json(res, 200, { ok: true, lease: leaseView(), metrics: engine.metrics(), handshakeRecovery: engine.handshakeRecovery(), stats: stats, config: describeConfig({ httpPort: PORT }), requests: Object.fromEntries(reqCounts) });
       return;
     }
 

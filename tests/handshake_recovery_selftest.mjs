@@ -15,8 +15,15 @@
  *
  * 复现手法：mock A = **吞掉协议探测包、但正常回答业务命令**
  *   （精确模拟"探测那一下漏了、命令还能用"，也就是用户机器上的现场）。
- * 修复判据：把 mock A 换成会回探测包的 mock B（**同一端口**）后，
+ * 修复判据：让同一个 mock 开始回探测包（**同 socket、同端口**）后，
  *   **无需任何人工干预**，`/host/ready` 必须自己回到 `ready:true`。
+ *
+ * 第二种死锁（评审要求补）：addon 先完全不在（Blender 被关/重开）→ 之后再启动。
+ *   这里同样要求 `/host/ready` 靠后台恢复重新连回去，而不是等某条业务命令来唤醒。
+ *
+ * 判据 11（评审要求钉住）：自愈调度不得污染响应路径 ——
+ *   `handshake-stale` 期间连打 `/host/ready`，`/who` 的 `metrics.calls` 增量必须为 **0**，
+ *   中位延迟 < 50ms（否则就成了"顺手做握手/探活"）。
  *
  * 前提断言：第 ⑤ 步必须真的复现出 handshake-stale。复现不出来就直接判失败——
  *   一个没复现现场的测试不能算通过（否则"改坏了"和"修好了"都表现为绿）。
@@ -31,7 +38,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(HERE, '..');
@@ -118,14 +125,14 @@ function listenOn(srv, port) {
     srv.listen(port, '127.0.0.1', () => resolve(true));
   });
 }
-const close = (srv) => new Promise((r) => {
-  if (!srv) return r(true);
+const closeServer = (srv) => new Promise((resolve) => {
+  if (!srv) return resolve(false);
   // ⚠ 两个坑（都实测踩过）：
   //   ① server.close() 会**等已有连接结束**，而后端正握着到 mock 的 socket ⇒ 不强制断开就永远卡住；
   //   ② `closeAllConnections()` 只存在于 http.Server，**net.Server 没有** —— 写成它会被 try/catch 吞掉，
   //      表现为"看着优雅、实际没断"，最后靠看门狗才暴露。所以自己跟踪 socket 并 destroy。
   try { for (const s of (srv.__sockets || [])) { try { s.destroy(); } catch (e) {} } } catch (e) {}
-  try { srv.close(() => r(true)); } catch (e) { r(false); }
+  try { srv.close(() => resolve(true)); } catch (e) { resolve(false); }
 });
 const freePort = () => new Promise((resolve, reject) => {
   const s = net.createServer();
@@ -151,7 +158,8 @@ const cleanup = () => {
 };
 process.on('exit', cleanup);
 // 看门狗：测试绝不允许挂死（挂死的测试比失败的测试更糟 —— 会阻塞整条流水线）
-const WATCHDOG_MS = Number(process.env.DSH_HANDSHAKE_TEST_WATCHDOG_MS || 120000);
+// 常态约 2s；未修版最坏会等满 ⑤ 的 25s + ⑥ 的 20s，60s 足够收尸。
+const WATCHDOG_MS = Number(process.env.DSH_HANDSHAKE_TEST_WATCHDOG_MS || 60000);
 const watchdog = setTimeout(() => {
   console.log('  ✗ 看门狗超时（' + Math.round(WATCHDOG_MS / 1000) + 's）——测试被判定失败，避免挂死');
   cleanup();
@@ -160,6 +168,32 @@ const watchdog = setTimeout(() => {
 watchdog.unref?.();
 
 try {
+  // ⓪ 评审要求的并发护栏（单元级）：自愈恢复是唯一绕过 send 串行队列的 ensure() 调用方。
+  //    并发 ensure() 必须共用一条 TCP；旧 socket 迟到的 close 不得把当前 socket 置空。
+  const { AddonClient } = await import(pathToFileURL(path.join(RUNTIME, 'engine.mjs')).href);
+  const ensurePort = await freePort();
+  let ensureConns = 0;
+  const ensureSockets = new Set();
+  const ensureSrv = net.createServer((s) => { ensureConns++; ensureSockets.add(s); s.on('error', () => {}); });
+  ensureSrv.__sockets = ensureSockets;       // 未修版会开多条连接，收尾必须全部销毁，否则 close 永远等
+  await listenOn(ensureSrv, ensurePort);
+  const ac = new AddonClient({ host: '127.0.0.1', port: ensurePort });
+  try {
+    await Promise.all([ac.ensure(), ac.ensure(), ac.ensure()]);
+    await sleep(100);
+    ok('⓪ 并发 ensure() 单飞：只开 1 条 TCP（评审要求）', ensureConns === 1, 'connections=' + ensureConns);
+    const stale = ac.sock;
+    await ac.connect();                       // 故意造一条"非当前"socket
+    const current = ac.sock;
+    stale.destroy();
+    await sleep(100);
+    ok('⓪b 旧 socket 的 close 不会把当前 socket 置空（不制造假 addon-unreachable）',
+      ac.sock === current && ac.sock !== null, 'sock=' + (ac.sock ? 'alive' : 'null'));
+  } finally {
+    try { ac.close(); } catch (e) {}
+    await closeServer(ensureSrv);
+  }
+
   const addonPort = await freePort();
   const state = { deaf: true };
   srvA = makeMock(state);
@@ -203,6 +237,30 @@ try {
   ok('③b 此时 addon 仍报 connected（所以人工排查会误判成"通道没问题"）',
     ready.addon === true, JSON.stringify(ready));
 
+  // ③c 判据 11（评审要求钉住）：自愈不能让 /host/ready 变成"顺手探活"。
+  //     仍处于 handshake-stale：连打 12 次，响应路径必须零 bpy 往返、延迟仍是一毫秒级。
+  const who0 = (await req('GET', '/who', undefined, 8000)).body || {};
+  const calls0 = who0.metrics ? who0.metrics.calls : null;
+  const samples = [];
+  for (let i = 0; i < 12; i++) {
+    const ts = Date.now();
+    await req('GET', '/host/ready', undefined, 8000);
+    samples.push(Date.now() - ts);
+  }
+  const who1 = (await req('GET', '/who', undefined, 8000)).body || {};
+  const calls1 = who1.metrics ? who1.metrics.calls : null;
+  const sorted = samples.slice().sort((a, b) => a - b);
+  const median = sorted.length ? sorted[Math.floor(sorted.length / 2)] : null;
+  const delta = (calls0 !== null && calls1 !== null) ? calls1 - calls0 : null;
+  ok('③c 判据 11：/host/ready 响应路径不碰 Blender（/who metrics.calls 增量 0）',
+    delta === 0, 'calls ' + calls0 + ' → ' + calls1 + '，样本 ' + samples.join(',') + ' ms');
+  ok('③c2 判据 11：/host/ready 中位延迟 < 50 ms（响应只读缓存）',
+    median !== null && median < 50, 'median ' + median + ' ms，样本 ' + samples.join(','));
+  ok('③c3 /who 暴露自愈诊断（attempts / lastOkAt / lastError），售后可查',
+    !!(who1.handshakeRecovery && typeof who1.handshakeRecovery.attempts === 'number'
+      && who1.handshakeRecovery.attempts >= 1),
+    JSON.stringify(who1.handshakeRecovery));
+
   // ④ 让同一个 addon 开始回答探测包（现场：主线程空下来，探测终于能回包）
   //    单变量、同 socket、同端口 —— 不引入 addon-unreachable 这个无关状态
   state.deaf = false;
@@ -222,6 +280,36 @@ try {
   }
   ok('⑤ 探测恢复后 /host/ready 自愈为 ready:true（无需人工干预、无需重启）',
     recovered, '等了 ' + Math.round((Date.now() - t0) / 1000) + 's，最后状态 ' + JSON.stringify(last));
+
+  // ⑥ 第二种死锁（评审要求补）：addon 先完全不在（Blender 被关/重开）→ 之后启动。
+  //    先关掉 mock：后端的常驻 socket 会收到 close ⇒ 必须如实变成 addon-unreachable。
+  await closeServer(srvA);
+  srvA = null;
+  let unreachable = null;
+  const tu = Date.now();
+  while (Date.now() - tu < 10000) {
+    const r = (await req('GET', '/host/ready', undefined, 8000)).body || {};
+    unreachable = r;
+    if (r.ready === false && r.reason === 'addon-unreachable') break;
+    await sleep(300);
+  }
+  ok('⑥ 关掉 addon 后 /host/ready 如实变成 addon-unreachable',
+    !!(unreachable && unreachable.ready === false && unreachable.reason === 'addon-unreachable'),
+    JSON.stringify(unreachable));
+
+  // 同一端口重新拉起 addon：修复版应靠 /host/ready 的后台恢复自己连回来。
+  srvB = makeMock({ deaf: false });
+  await listenOn(srvB, addonPort);
+  const tr = Date.now();
+  let reconnected = false, last2 = null;
+  while (Date.now() - tr < RECOVER_WINDOW_MS) {
+    const r = (await req('GET', '/host/ready', undefined, 8000)).body || {};
+    last2 = r;
+    if (r.ready === true) { reconnected = true; break; }
+    await sleep(1000);
+  }
+  ok('⑥b addon 重新启动后 /host/ready 自愈为 ready:true（addon-unreachable 路径）',
+    reconnected, '等了 ' + Math.round((Date.now() - tr) / 1000) + 's，最后状态 ' + JSON.stringify(last2));
 } catch (e) {
   fail++;
   failures.push('异常：' + String((e && e.message) || e));
